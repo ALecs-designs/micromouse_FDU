@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""
+Integrated Sensor System:
+  • Three VL53L0X ToF sensors (0x30, 0x31, 0x32)
+  • LSM6DSOX IMU (accel + gyro)
+  • LIS3MDL magnetometer
+Uses software I²C bus 3 on GPIO23(SDA) / GPIO24(SCL)
+"""
+
+import time
+import board, digitalio
+import adafruit_extended_bus
+import adafruit_vl53l0x
+import adafruit_lsm6ds.lsm6dsox
+import adafruit_lis3mdl
+
+# =====================================================
+# 1. I2C BUS SETUP  (/dev/i2c-3 overlay)
+# =====================================================
+i2c = adafruit_extended_bus.ExtendedI2C(3)
+
+# =====================================================
+# 2. VL53L0X CONFIGURATION
+# =====================================================
+xshut_pins = [board.D17, board.D27, board.D22]     # BCM pins
+vl53_addresses = [0x30, 0x31, 0x32]
+vl53_sensors = []
+
+# --- Reset all sensors (XSHUT low) ---
+xshuts = []
+for pin in xshut_pins:
+    p = digitalio.DigitalInOut(pin)
+    p.direction = digitalio.Direction.OUTPUT
+    p.value = False
+    xshuts.append(p)
+time.sleep(0.1)
+
+# --- Bring each sensor online and assign address ---
+for i, addr in enumerate(vl53_addresses):
+    xshuts[i].value = True           # power up one sensor
+    time.sleep(0.6)                  # wait for boot
+    try:
+        vl53 = adafruit_vl53l0x.VL53L0X(i2c)  # default addr 0x29
+        vl53.set_address(addr)
+        vl53_sensors.append(vl53)
+        print(f"✅ VL53L0X sensor {i+1} initialized at {hex(addr)}")
+    except Exception as e:
+        print(f"❌ VL53L0X sensor {i+1} failed to init: {e}")
+
+# =====================================================
+# 3. IMU + MAGNETOMETER INITIALIZATION
+# =====================================================
+try:
+    imu = adafruit_lsm6ds.lsm6dsox.LSM6DSOX(i2c, address=0x6B)
+    print("✅ LSM6DSOX IMU initialized at 0x6B")
+except Exception as e:
+    print(f"❌ IMU init failed: {e}")
+    imu = None
+
+try:
+    mag = adafruit_lis3mdl.LIS3MDL(i2c, address=0x1E)
+    print("✅ LIS3MDL magnetometer initialized at 0x1E")
+except Exception as e:
+    print(f"❌ Magnetometer init failed: {e}")
+    mag = None
+
+# =====================================================
+# 4. MAIN LOOP
+# =====================================================
+print("\nStarting sensor-fusion loop… (Ctrl+C to stop)\n")
+
+try:
+    while True:
+        # --- ToF distances ---
+        distances = []
+        for s in vl53_sensors:
+            try:
+                distances.append(s.range)
+            except Exception:
+                distances.append(None)
+
+        # --- IMU readings ---
+        if imu:
+            ax, ay, az = imu.acceleration
+            gx, gy, gz = imu.gyro
+        else:
+            ax = ay = az = gx = gy = gz = None
+
+        # --- Magnetometer readings ---
+        if mag:
+            mx, my, mz = mag.magnetic
+        else:
+            mx = my = mz = None
+
+        # --- Print formatted output ---
+        print(
+            f"VL53L0X: {distances} mm | "
+            f"Accel: ({ax:.2f}, {ay:.2f}, {az:.2f}) m/s² | "
+            f"Gyro: ({gx:.2f}, {gy:.2f}, {gz:.2f}) rad/s | "
+            f"Mag: ({mx:.2f}, {my:.2f}, {mz:.2f}) µT"
+        )
+
+        time.sleep(0.3)
+
+except KeyboardInterrupt:
+    print("\n🛑 Stopped by user. Resetting sensors…")
+    # Safely drive all XSHUT low, then high to free the bus
+    for p in xshuts:
+        p.value = False
+    time.sleep(0.05)
+    for p in xshuts:
+        p.value = True
+    print("✅ Sensors reset. Program exited cleanly.")
