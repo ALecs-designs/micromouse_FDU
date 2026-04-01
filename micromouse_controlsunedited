@@ -279,6 +279,36 @@ def main():
         count = 0
         while True:
             count += 1
+                # --- ToF distances ---
+            distances = []
+            for s in vl53_sensors:
+                try:
+                    distances.append(s.range)
+                except Exception:
+                    distances.append(None)
+
+            # --- IMU readings ---
+            if imu:
+                ax, ay, az = imu.acceleration
+                gx, gy, gz = imu.gyro
+            else:
+                ax = ay = az = gx = gy = gz = None
+
+            # --- Magnetometer readings ---
+            if mag:
+                mx, my, mz = mag.magnetic
+            else:
+                mx = my = mz = None
+
+            # --- Print formatted output ---
+            print(
+                f"VL53L0X: {distances} mm | "
+                f"Accel: ({ax:.2f}, {ay:.2f}, {az:.2f}) m/s² | "
+                f"Gyro: ({gx:.2f}, {gy:.2f}, {gz:.2f}) rad/s | "
+                f"Mag: ({mx:.2f}, {my:.2f}, {mz:.2f}) µT"
+            )
+
+            time.sleep(0.3)
 
             # read ToF distances
             distances = []
