@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""
+odometry.py
+-----------
+Micromouse Encoder + Odometry with Calibration
+Reusable module for distance & heading tracking.
+
+Odometry - Use of data from motion sensors to estimate change in position over time
+"""
+
+import RPi.GPIO as GPIO
+import time
+import math
+
+
+class EncoderOdometry:
+    def __init__(self,left_a, left_b, right_a, right_b, gear_ratio=30, enc_ticks=12, wheel_diam=32.0, track_width=100.0):
+
+        # Pin setup
+        self.left_a  = left_a
+        self.left_b  = left_b
+        self.right_a = right_a
+        self.right_b = right_b
+
+        # Robot parameters
+        self.gear_ratio  = gear_ratio
+        self.enc_ticks   = enc_ticks
+        self.wheel_diam  = wheel_diam      # mm
+        self.track_width = track_width     # mm
+
+        # Derived constants
+        self.ticks_per_rev = gear_ratio * enc_ticks
+        self.mm_per_tick   = (math.pi * wheel_diam) / self.ticks_per_rev
+
+        # State variables
+        self.encoder_left_count  = 0
+        self.encoder_right_count = 0
+        self.left_direction  = "STOP"
+        self.right_direction = "STOP"
+        self.distance_left   = 0.0
+        self.distance_right  = 0.0
+        self.distance_avg    = 0.0
+        self.heading_angle   = 0.0
+
+        # GPIO setup
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup([left_a, left_b, right_a, right_b],
+                   GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+        # Attach interrupts on A channels
+        GPIO.add_event_detect(left_a,  GPIO.BOTH, callback=self._left_callback,  bouncetime=1)
+        GPIO.add_event_detect(right_a, GPIO.BOTH, callback=self._right_callback, bouncetime=1)
+
+    # ───────────────────────────────
+    # CALLBACKS (ISRs)
+    # ───────────────────────────────
+    def _left_callback(self, channel):
+        a = GPIO.input(self.left_a)
+        b = GPIO.input(self.left_b)
+        if a == b:
+            self.encoder_left_count += 1
+            self.left_direction = "CW"
+        else:
+            self.encoder_left_count -= 1
+            self.left_direction = "CCW"
+
+    def _right_callback(self, channel):
+        a = GPIO.input(self.right_a)
+        b = GPIO.input(self.right_b)
+        if a == b:
+            self.encoder_right_count += 1
+            self.right_direction = "CW"
+        else:
+            self.encoder_right_count -= 1
+            self.right_direction = "CCW"
+
+    # ───────────────────────────────
+    # PUBLIC METHODS
+    # ───────────────────────────────
+    def reset(self):
+        """ Reset encoders and odometry """
+        self.encoder_left_count  = 0
+        self.encoder_right_count = 0
+        self.left_direction      = "STOP"
+        self.right_direction     = "STOP"
+        self.distance_left       = 0.0
+        self.distance_right      = 0.0
+        self.distance_avg        = 0.0
+        self.heading_angle       = 0.0
+
+    def update(self):
+        """ Update odometry calculations """
+        self.distance_left  = self.encoder_left_count  * self.mm_per_tick
+        self.distance_right = self.encoder_right_count * self.mm_per_tick
+        self.distance_avg   = 0.5 * (self.distance_left + self.distance_right)
+        self.heading_angle  = ((self.distance_right - self.distance_left)
+                               / self.track_width) * (180.0 / math.pi)
+
+    def get_counts(self):
+        return self.encoder_left_count, self.encoder_right_count
+
+    def get_distance(self):
+        return self.distance_avg
+
+    def get_heading(self):
+        return self.heading_angle
+
+    def get_straight_error(self):
+        return self.distance_right - self.distance_left
+
+    def get_turn_error(self, target_angle):
+        return target_angle - self.heading_angle
+
+    def cleanup(self):
+        GPIO.cleanup()
+
+
+# ───────────────────────────────
+# CALIBRATION ROUTINES
+# ───────────────────────────────
+def forward_calibration(odo, expected_mm):
+    """Forward calibration (one wheel revolution)."""
+    odo.reset()
+    print("[CALIB] Drive forward one wheel revolution...")
+    time.sleep(5)
+    odo.update()
+
+    measured = odo.get_distance()
+    error = expected_mm - measured
+    print(f"[RESULT] Expected {expected_mm:.2f} mm, Measured {measured:.2f} mm, Error {error:.2f} mm")
+
+
+def rotation_calibration(odo):
+    """Rotation calibration (spin 360°)."""
+    odo.reset()
+    print("[CALIB] Rotate robot 360° in place...")
+    time.sleep(5)
+    odo.update()
+
+    measured = odo.get_heading()
+    error = 360 - measured
+    print(f"[RESULT] Expected 360.00°, Measured {measured:.2f}°, Error {error:.2f}°")
