@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+micromouse_ahrs_integrated.py
+Full Micromouse Stack: AHRS Fusion + Sequential ToF + Motor Control
+"""
+
+import sys
+import time
+import math
+import board
+import digitalio
+import adafruit_extended_bus
+import adafruit_vl53l0x
+import adafruit_lsm6ds.lsm6dsox
+import adafruit_lis3mdl
+from gpiozero import PWMOutputDevice, DigitalOutputDevice
+import RPi.GPIO as GPIO
+
+# =====================================================
+# 1. AHRS SENSOR FUSION CLASS
+# =====================================================
+class AHRS:
+    def __init__(self, alpha=0.98):
+        self.alpha = alpha  # Filter coefficient (high = trust gyro more)
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.yaw = 0.0
+        self.last_time = None
+
+    def update(self, accel, gyro, mag):
+        now = time.monotonic()
+        if self.last_time is None:
+            self.last_time = now
+            return
+        dt = now - self.last_time
+        self.last_time = now
+
+        # 1. Accel Orientation (Roll/Pitch)
+        # LSM6DSOX returns m/s^2
+        ax, ay, az = accel
+        accel_pitch = math.atan2(ay, math.sqrt(ax**2 + az**2))
+        accel_roll = math.atan2(-ax, az)
+
+        # 2. Gyro Integration (rad/s)
+        gx, gy, gz = gyro
+        self.pitch = self.alpha * (self.pitch + gy * dt) + (1 - self.alpha) * accel_pitch
+        self.roll = self.alpha * (self.roll + gx * dt) + (1 - self.alpha) * accel_roll
+
+        # 3. Magnetometer (Tilt-Compensated Heading)
+        mx, my, mz = mag
+        Xh = mx * math.cos(self.pitch) + mz * math.sin(self.pitch)
+        Yh = mx * math.sin(self.roll) * math.sin(self.pitch) + \
+             my * math.cos(self.roll) - \
+             mz * math.sin(self.roll) * math.cos(self.pitch)
+        
+        heading = math.degrees(math.atan2(-Yh, Xh))
+        self.yaw = heading if heading >= 0 else heading + 360
+
+    def get_orientation(self):
+        return math.degrees(self.roll), math.degrees(self.pitch), self.yaw
+
+# =====================================================
+# 2. HARDWARE PINS & I2C SETUP
+# =====================================================
+i2c = adafruit_extended_bus.ExtendedI2C(3)
+
+# Motor Driver Pins (TB6612FNG)
+PWMA_PIN, PWMB_PIN = 12, 13
+AIN1_PIN, AIN2_PIN = 15, 14
+BIN1_PIN, BIN2_PIN = 16, 25
+STBY_PIN = 18
+
+# ToF XSHUT Pins
+XSHUT_PINS = [board.D17, board.D22, board.D27] # Right, Front, Left
+TARGET_ADDRS = [0x30, 0x31, 0x32]
+
+# =====================================================
+# 3. MOTOR CONTROL FUNCTIONS
+# =====================================================
+pwmA = PWMOutputDevice(PWMA_PIN, frequency=1000)
+pwmB = PWMOutputDevice(PWMB_PIN, frequency=1000)
+AIN1 = DigitalOutputDevice(AIN1_PIN)
+AIN2 = DigitalOutputDevice(AIN2_PIN)
+BIN1 = DigitalOutputDevice(BIN1_PIN)
+BIN2 = DigitalOutputDevice(BIN2_PIN)
+STBY = DigitalOutputDevice(STBY_PIN)
+
+def motor_enable(): STBY.on()
+def motor_disable(): STBY.off()
+
+def set_motors(l_speed, r_speed, l_dir="F", r_dir="F"):
+    # Left Motor
+    if l_dir == "F": AIN1.on(); AIN2.off()
+    elif l_dir == "R": AIN1.off(); AIN2.on()
+    else: AIN1.off(); AIN2.off()
+    
+    # Right Motor
+    if r_dir == "F": BIN1.on(); BIN2.off()
+    elif r_dir == "R": BIN1.off(); BIN2.on()
+    else: BIN1.off(); BIN2.off()
+    
+    pwmA.value = max(0, min(100, l_speed)) / 100.0
+    pwmB.value = max(0, min(100, r_speed)) / 100.0
+
+def brake():
+    AIN1.on(); AIN2.on(); BIN1.on(); BIN2.on()
+    pwmA.value = 0; pwmB.value = 0
+
+# =====================================================
+# 4. SENSOR INITIALIZATION
+# =====================================================
+def init_sensors():
+    # A. VL53L0X Sequential Addressing
+    xshuts = []
+    vl53s = []
+    for pin in XSHUT_PINS:
+        p = digitalio.DigitalInOut(pin)
+        p.direction = digitalio.Direction.OUTPUT
+        p.value = False
+        xshuts.append(p)
+    time.sleep(0.2)
+
+    for i, addr in enumerate(TARGET_ADDRS):
+        xshuts[i].value = True
+        time.sleep(0.2)
+        v = adafruit_vl53l0x.VL53L0X(i2c)
+        v.set_address(addr)
+        vl53s.append(v)
+        print(f"✅ ToF S{i+1} at {hex(addr)}")
+
+    # B. IMU & Mag
+    imu = adafruit_lsm6ds.lsm6dsox.LSM6DSOX(i2c, address=0x6B)
+    mag = adafruit_lis3mdl.LIS3MDL(i2c, address=0x1E)
+    print("✅ IMU and Magnetometer online.")
+    
+    return vl53s, imu, mag
+
+# =====================================================
+# 5. MAIN NAVIGATION LOOP
+# =====================================================
+def main():
+    try:
+        vl53s, imu, mag = init_sensors()
+        ahrs = AHRS(alpha=0.96)
+        motor_enable()
+        
+        print("\n🚀 AHRS Micromouse Active. Press Ctrl+C to stop.")
+        
+        while True:
+            # 1. READ AHRS (High Frequency)
+            accel = imu.acceleration
+            gyro = imu.gyro
+            magnetic = mag.magnetic
+            ahrs.update(accel, gyro, magnetic)
+            roll, pitch, yaw = ahrs.get_orientation()
+
+            # 2. READ ToF (Slower)
+            try:
+                dist = [s.range for s in vl53s]
+                r_dist, f_dist, l_dist = dist
+            except:
+                continue
+
+            # 3. PRINT STATUS
+            print(f"Hdg: {yaw:3.0f}° | R:{r_dist:3} F:{f_dist:3} L:{l_dist:3}", end='\r')
+
+            # 4. LOGIC: BASIC OBSTACLE AVOIDANCE
+            # Use AHRS 'yaw' to maintain a straight line!
+            if f_dist < 80:
+                brake()
+                time.sleep(0.1)
+                if l_dist > r_dist:
+                    print("\n↩ Turning Left...")
+                    set_motors(30, 30, "R", "F")
+                else:
+                    print("\n↪ Turning Right...")
+                    set_motors(30, 30, "F", "R")
+                time.sleep(0.4)
+            else:
+                # Drive forward - you could use 'yaw' here for PID straight-line correction
+                set_motors(40, 40, "F", "F")
+
+            time.sleep(0.02) # ~50Hz loop
+
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down safely...")
+    finally:
+        brake()
+        motor_disable()
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
