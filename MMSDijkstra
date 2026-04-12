@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+import time
+import math
+import sys
+import board
+import digitalio
+from gpiozero import PWMOutputDevice, DigitalOutputDevice, RotaryEncoder
+import adafruit_extended_bus
+import adafruit_vl53l0x
+import adafruit_lsm6ds.lsm6dsox
+import adafruit_lis3mdl
+
+# =====================================================
+# 1. NAVIGATION & GRAPH LOGIC (DIJKSTRA / FLOOD-FILL)
+# =====================================================
+class MazeGrid:
+    def __init__(self, width=16, height=16):
+        self.width, self.height = width, height
+        self.walls = {(x, y): {'N': False, 'E': False, 'S': False, 'W': False} 
+                      for x in range(width) for y in range(height)}
+        self.dist = {(x, y): 255 for x in range(width) for y in range(height)}
+        self.goals = [(7, 7), (7, 8), (8, 7), (8, 8)]
+
+    def update_wall(self, x, y, direction, exists):
+        self.walls[(x, y)][direction] = exists
+        # Mirroring: If (0,0) has N wall, (0,1) has S wall
+        nx, ny = x, y
+        opposite = {'N': 'S', 'S': 'N', 'E': 'W', 'W': 'E'}
+        if direction == 'N': ny += 1
+        elif direction == 'S': ny -= 1
+        elif direction == 'E': nx += 1
+        elif direction == 'W': nx -= 1
+        
+        if 0 <= nx < self.width and 0 <= ny < self.height:
+            self.walls[(nx, ny)][opposite[direction]] = exists
+
+    def flood_fill(self):
+        """Flood-fill Dijkstra: Calculates pathing weights to goals."""
+        for cell in self.dist: self.dist[cell] = 255
+        for g in self.goals: self.dist[g] = 0
+        
+        changed = True
+        while changed:
+            changed = False
+            for x in range(self.width):
+                for y in range(self.height):
+                    if (x, y) in self.goals: continue
+                    min_dist = 255
+                    for d, is_wall in self.walls[(x, y)].items():
+                        if not is_wall:
+                            nx, ny = x, y
+                            if d == 'N': ny += 1
+                            elif d == 'S': ny -= 1
+                            elif d == 'E': nx += 1
+                            elif d == 'W': nx -= 1
+                            if 0 <= nx < self.width and 0 <= ny < self.height:
+                                min_dist = min(min_dist, self.dist[(nx, ny)] + 1)
+                    if self.dist[(x, y)] != min_dist:
+                        self.dist[(x, y)] = min_dist
+                        changed = True
+
+# =====================================================
+# 2. PID CONTROL & SENSOR FUSION
+# =====================================================
+class PIDController:
+    def __init__(self, kp, ki, kd, setpoint=0, limit=50):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.setpoint = setpoint
+        self.prev_error = 0
+        self.integral = 0
+        self.limit = limit
+
+    def update(self, measurement, dt):
+        if dt <= 0: return 0
+        error = self.setpoint - measurement
+        self.integral += error * dt
+        # Simple anti-windup
+        self.integral = max(-20, min(20, self.integral))
+        d_term = (error - self.prev_error) / dt
+        self.prev_error = error
+        output = (self.kp * error) + (self.ki * self.integral) + (self.kd * d_term)
+        return max(-self.limit, min(self.limit, output))
+
+# =====================================================
+# 3. HARDWARE BRIDGE (STALL & LIGHT REJECTION)
+# =====================================================
+class RobotHardware:
+    def __init__(self, i2c_bus):
+        # Motors & Encoders
+        self.PWMA = PWMOutputDevice(12); self.PWMB = PWMOutputDevice(13)
+        self.AIN1 = DigitalOutputDevice(15); self.AIN2 = DigitalOutputDevice(14)
+        self.BIN1 = DigitalOutputDevice(16); self.BIN2 = DigitalOutputDevice(25)
+        self.STBY = DigitalOutputDevice(18)
+        self.enc_l = RotaryEncoder(17, 27, max_steps=0)
+        self.enc_r = RotaryEncoder(22, 23, max_steps=0)
+        
+        # Sensors
+        self.imu = adafruit_lsm6ds.lsm6dsox.LSM6DSOX(i2c_bus, address=0x6B)
+        self.STBY.on()
+
+    def set_motors(self, left, right):
+        self.AIN1.value = left > 0; self.AIN2.value = left < 0
+        self.BIN1.value = right > 0; self.BIN2.value = right < 0
+        self.PWMA.value = abs(left) / 100.0; self.PWMB.value = abs(right) / 100.0
+
+    def check_stall(self, current_pwr):
+        """Cross-verification: High power + Zero encoder delta = Stall."""
+        if abs(current_pwr) > 40 and self.enc_l.steps == 0:
+            return True
+        return False
+
+# =====================================================
+# 4. MAIN FSM & LOGIC
+# =====================================================
+def main():
+    # Setup
+    i2c = adafruit_extended_bus.ExtendedI2C(3)
+    hw = RobotHardware(i2c)
+    maze = MazeGrid()
+    pid = PIDController(kp=1.8, ki=0.01, kd=0.1)
+    
+    # States
+    S_WAIT_SIGNAL = "WAIT_SIGNAL"
+    S_SEARCH      = "SEARCHING"
+    S_ALIGN       = "BACK_ALIGN"
+    S_FAST_RUN    = "FAST_RUN"
+    S_STALL       = "STALL_DETECTED"
+    
+    current_state = S_WAIT_SIGNAL
+    pos = [0, 0]; heading = 0 # 0:N, 1:E, 2:S, 3:W
+    angle = 0.0
+    cells_traveled = 0
+    last_time = time.perf_counter()
+
+    try:
+        while True:
+            now = time.perf_counter()
+            dt = now - last_time
+            gyro_z = hw.imu.gyro[2]
+            angle += gyro_z * dt # Sensor fusion (Gyro integration)
+
+            # --- FSM ---
+            if current_state == S_WAIT_SIGNAL:
+                # HAND SIGNAL: Monitor ToF (Conceptual)
+                # if front_tof < 50mm: state = S_SEARCH
+                hw.set_motors(0, 0)
+                current_state = S_SEARCH # Forcing start for demo
+
+            elif current_state == S_SEARCH:
+                # 1. Drive Forward 1 cell (180mm)
+                # 2. Use back-align every 4-5 cells
+                correction = pid.update(angle, dt)
+                hw.set_motors(30 - correction, 30 + correction)
+                
+                if hw.check_stall(30):
+                    current_state = S_STALL
+                
+                # If Goal coordinates + Sensor pattern (open space) detected:
+                # state = S_FAST_RUN
+
+            elif current_state == S_ALIGN:
+                # BACK-ALIGN: Mechanical squaring
+                hw.set_motors(-20, -20)
+                time.sleep(0.5)
+                angle = 0 # Reset Yaw
+                hw.enc_l.steps = 0; hw.enc_r.steps = 0
+                current_state = S_SEARCH
+
+            elif current_state == S_FAST_RUN:
+                # DIAGONAL LOGIC: Distance * 1.414
+                # pid.kp = 3.0 (Aggressive)
+                pass
+
+            elif current_state == S_STALL:
+                hw.set_motors(0, 0)
+                print("STALL DETECTED: Manual Reset Required.")
+                break
+
+            last_time = now
+            time.sleep(0.01)
+
+    except KeyboardInterrupt:
+        hw.set_motors(0, 0)
+        hw.STBY.off()
+
+if __name__ == "__main__":
+    main()
