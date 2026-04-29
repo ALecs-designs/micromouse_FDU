@@ -372,7 +372,7 @@ def main():
             
             def LS_trigger(self, distances):
                 # checks if sensor distance reading is within a certain threshold and returns a boolean
-                is_close = False
+                """is_close = False
                 threshold = 53; # about 53mm. Mouse Chassis is 5" and cells are 18cm^2
                 if distances[0] is not None:   
                     if distances[0]<threshold:
@@ -381,7 +381,7 @@ def main():
                 else:
                     return False 
                     except: 
-                        return is_close
+                        return is_close"""
             
 
 
