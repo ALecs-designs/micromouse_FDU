@@ -1,6 +1,6 @@
-# micromouseproject FDU
+# Micromouse FDU
 
-Micromouse Project Repository for FDU
+Micromouse FDU
 # READ ME
 
 ## Intro 
